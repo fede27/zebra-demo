@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Test Browser Print</title>
+<style>
+  :root { --bg:#fff; --fg:#1b1b1b; --muted:#666; --line:#ddd; --ok:#1a7f37; --err:#c62828; --btn:#1f4e79; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161616; --fg:#eee; --muted:#aaa; --line:#333; --ok:#4caf50; --err:#ef5350; --btn:#3d7ab8; } }
+  body { font-family: system-ui, sans-serif; background:var(--bg); color:var(--fg); margin:0; padding:16px; max-width:720px; }
+  h1 { font-size:1.2rem; margin:0 0 4px; }
+  .muted { color:var(--muted); font-size:.85rem; }
+  label { display:block; font-size:.85rem; margin:12px 0 4px; color:var(--muted); }
+  input, textarea, select { width:100%; box-sizing:border-box; font:inherit; padding:8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); }
+  textarea { font-family: ui-monospace, monospace; min-height:110px; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+  button { flex:1 1 140px; padding:12px; font:inherit; border:0; border-radius:6px; background:var(--btn); color:#fff; }
+  #log { margin-top:16px; font-family: ui-monospace, monospace; font-size:.8rem; white-space:pre-wrap; border:1px solid var(--line); border-radius:6px; padding:8px; min-height:120px; }
+  .ok { color:var(--ok); } .err { color:var(--err); }
+</style>
+</head>
+<body>
+<h1>Test Browser Print (senza libreria Zebra)</h1>
+<div class="muted" id="env"></div>
+
+<label for="base">URL del servizio Browser Print</label>
+<input id="base" value="http://127.0.0.1:9100/">
+
+<label for="dev">Stampante</label>
+<select id="dev"></select>
+
+<div class="row">
+  <button onclick="getDefault()">Stampante di default</button>
+  <button onclick="getAvailable()">Discovery</button>
+  <button onclick="getConfig()">Config app</button>
+</div>
+
+<label for="zpl">ZPL da inviare</label>
+<textarea id="zpl">^XA
+^FO50,50^A0N,50,50^FDTest da browser^FS
+^FO50,120^BY2^BCN,80,Y,N,N^FD123456789^FS
+^XZ</textarea>
+
+<div class="row">
+  <button onclick="printZpl()">Stampa ZPL</button>
+  <button onclick="status()">Stato (~HS)</button>
+  <button onclick="document.getElementById('log').textContent=''">Pulisci log</button>
+</div>
+
+<div id="log"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let devices = [];
+
+function log(msg, cls) {
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = new Date().toLocaleTimeString() + '  ' + msg;
+  $('log').prepend(line);
+}
+
+// fetch con timeout e messaggi d'errore leggibili (la libreria Zebra restituisce stringa vuota)
+async function call(method, path, body, timeoutMs = 20000) {
+  const url = $('base').value.replace(/\/?$/, '/') + path;
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  log(method + ' ' + url);
+  try {
+    // body come stringa -> Content-Type text/plain: richiesta "semplice", niente preflight CORS
+    const r = await fetch(url, { method, body, signal: ctrl.signal });
+    const text = await r.text();
+    if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + r.statusText + (text ? ' — ' + text : ''));
+    return text;
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error('Timeout dopo ' + timeoutMs / 1000 + ' s (servizio lento o fermo)');
+    if (e instanceof TypeError) throw new Error(
+      'Richiesta bloccata o servizio non raggiungibile (' + e.message + '). ' +
+      'Cause probabili: permesso "accesso alla rete locale" negato/non concesso, pagina non HTTPS, ' +
+      'CORS del servizio, oppure app Browser Print chiusa. Il motivo esatto è nella Console (chrome://inspect).');
+    throw e;
+  } finally { clearTimeout(t); }
+}
+
+function selected() {
+  const d = devices[$('dev').selectedIndex];
+  if (!d) throw new Error('Nessuna stampante selezionata: premi prima "Stampante di default"');
+  return d;
+}
+
+function addDevice(d) {
+  if (devices.some(x => x.uid === d.uid)) return;
+  devices.push(d);
+  const o = document.createElement('option');
+  o.textContent = `${d.name || '(senza nome)'} — ${d.connection} — ${d.uid}`;
+  $('dev').add(o);
+}
+
+async function run(fn) { try { await fn(); } catch (e) { log(e.message, 'err'); } }
+
+const getDefault = () => run(async () => {
+  const txt = await call('GET', 'default?type=printer');
+  if (!txt) return log('Nessuna stampante di default impostata nell\'app', 'err');
+  const d = JSON.parse(txt); addDevice(d);
+  log('Default: ' + JSON.stringify(d), 'ok');
+});
+
+const getAvailable = () => run(async () => {
+  const res = JSON.parse(await call('GET', 'available', undefined, 60000));
+  (res.printer || []).forEach(addDevice);
+  log('Discovery: ' + JSON.stringify(res), 'ok');
+});
+
+const getConfig = () => run(async () => log('Config: ' + await call('GET', 'config'), 'ok'));
+
+const devicePayload = d => ({ name: d.name, uid: d.uid, connection: d.connection, deviceType: d.deviceType,
+  version: 2, provider: d.provider, manufacturer: d.manufacturer });
+
+const printZpl = () => run(async () => {
+  const d = selected();
+  await call('POST', 'write', JSON.stringify({ device: devicePayload(d), data: $('zpl').value }));
+  log('Inviato a ' + d.name + ' (il servizio non conferma la stampa: controlla la stampante)', 'ok');
+});
+
+const status = () => run(async () => {
+  const d = selected();
+  await call('POST', 'write', JSON.stringify({ device: devicePayload(d), data: '~HS' }));
+  let out = '';
+  for (let i = 0; i < 3 && !out; i++) {           // su Bluetooth la risposta può arrivare in ritardo
+    await new Promise(r => setTimeout(r, 500));
+    out = await call('POST', 'read', JSON.stringify({ device: devicePayload(d) }));
+  }
+  log(out ? 'Stato: ' + out : 'Nessuna risposta dalla stampante', out ? 'ok' : 'err');
+});
+
+// Diagnostica ambiente
+(async () => {
+  const info = [`Pagina: ${location.protocol}//${location.host}`, `Contesto sicuro: ${window.isSecureContext ? 'sì' : 'NO'}`];
+  for (const name of ['local-network-access', 'local-network', 'loopback-network']) {
+    try { const p = await navigator.permissions.query({ name }); info.push(`${name}: ${p.state}`); } catch {}
+  }
+  $('env').textContent = info.join(' · ');
+  if (!window.isSecureContext) log('Pagina non HTTPS: Chrome blocca le richieste verso localhost da siti pubblici non sicuri.', 'err');
+})();
+</script>
+</body>
+</html>
